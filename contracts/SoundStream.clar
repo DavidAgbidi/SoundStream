@@ -1,6 +1,6 @@
-;; SoundStream - Decentralized Music Rights Management System
-;; This contract enables musicians to register their tracks, manage royalties, and control streaming permissions
-;; Now supports multi-artist collaborations with split royalties
+;; SoundStream - Decentralized Music Rights Management System with NFT Integration
+;; This contract enables musicians to register their tracks as NFTs, manage royalties, and control streaming permissions
+;; Now supports multi-artist collaborations with split royalties and NFT minting
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -15,12 +15,20 @@
 (define-constant err-invalid-collaborators (err u108))
 (define-constant err-invalid-splits (err u109))
 (define-constant err-max-collaborators-exceeded (err u110))
+(define-constant err-nft-not-found (err u111))
+(define-constant err-nft-already-minted (err u112))
+(define-constant err-invalid-token-uri (err u113))
+(define-constant err-nft-transfer-failed (err u114))
 
 (define-constant max-collaborators u10)
+
+;; NFT Definition
+(define-non-fungible-token track-nft uint)
 
 ;; Data Variables
 (define-data-var track-counter uint u0)
 (define-data-var total-streams uint u0)
+(define-data-var nft-counter uint u0)
 
 ;; Data Maps
 (define-map tracks
@@ -34,7 +42,20 @@
         total-streams: uint,
         created-at: uint,
         active: bool,
-        is-collaboration: bool
+        is-collaboration: bool,
+        nft-id: (optional uint),
+        has-nft: bool
+    }
+)
+
+(define-map track-nfts
+    { nft-id: uint }
+    {
+        track-id: uint,
+        owner: principal,
+        token-uri: (string-ascii 256),
+        minted-at: uint,
+        streaming-rights: bool
     }
 )
 
@@ -69,6 +90,11 @@
     { total-earned: uint, total-streams: uint }
 )
 
+(define-map nft-ownership-history
+    { nft-id: uint, owner: principal }
+    { acquired-at: uint, is-current: bool }
+)
+
 ;; Private helper functions (must be defined first)
 (define-private (is-valid-royalty-rate (rate uint))
     (and (>= rate u0) (<= rate u100))
@@ -82,8 +108,16 @@
     (and (> (len str) u0) (<= (len str) u100))
 )
 
+(define-private (is-valid-token-uri (uri (string-ascii 256)))
+    (and (> (len uri) u0) (<= (len uri) u256))
+)
+
 (define-private (is-valid-track-id (track-id uint))
     (and (> track-id u0) (<= track-id (var-get track-counter)))
+)
+
+(define-private (is-valid-nft-id (nft-id uint))
+    (and (> nft-id u0) (<= nft-id (var-get nft-counter)))
 )
 
 (define-private (is-valid-principal (user principal))
@@ -99,6 +133,16 @@
         track-data (or 
             (is-eq user (get primary-artist track-data))
             (is-track-collaborator track-id user)
+        )
+        false
+    )
+)
+
+(define-private (has-streaming-rights (nft-id uint) (user principal))
+    (match (map-get? track-nfts { nft-id: nft-id })
+        nft-data (and
+            (is-eq user (get owner nft-data))
+            (get streaming-rights nft-data)
         )
         false
     )
@@ -185,6 +229,30 @@
     )
 )
 
+;; NFT URI function for SIP-009 compliance
+(define-read-only (get-token-uri (nft-id uint))
+    (if (is-valid-nft-id nft-id)
+        (match (map-get? track-nfts { nft-id: nft-id })
+            nft-data (ok (some (get token-uri nft-data)))
+            (ok none)
+        )
+        (ok none)
+    )
+)
+
+;; Get last token ID for SIP-009 compliance
+(define-read-only (get-last-token-id)
+    (ok (var-get nft-counter))
+)
+
+;; Get NFT owner for SIP-009 compliance
+(define-read-only (get-owner (nft-id uint))
+    (if (is-valid-nft-id nft-id)
+        (ok (nft-get-owner? track-nft nft-id))
+        (ok none)
+    )
+)
+
 ;; Read-only functions
 (define-read-only (get-track (track-id uint))
     (if (is-valid-track-id track-id)
@@ -193,8 +261,19 @@
     )
 )
 
+(define-read-only (get-track-nft (nft-id uint))
+    (if (is-valid-nft-id nft-id)
+        (map-get? track-nfts { nft-id: nft-id })
+        none
+    )
+)
+
 (define-read-only (get-track-counter)
     (var-get track-counter)
+)
+
+(define-read-only (get-nft-counter)
+    (var-get nft-counter)
 )
 
 (define-read-only (get-total-streams)
@@ -243,6 +322,13 @@
     )
 )
 
+(define-read-only (get-nft-ownership-history (nft-id uint) (owner principal))
+    (if (is-valid-nft-id nft-id)
+        (map-get? nft-ownership-history { nft-id: nft-id, owner: owner })
+        none
+    )
+)
+
 ;; Public functions
 (define-public (register-track (title (string-ascii 100)) 
                               (album (string-ascii 100)) 
@@ -265,7 +351,9 @@
                 total-streams: u0,
                 created-at: stacks-block-height,
                 active: true,
-                is-collaboration: false
+                is-collaboration: false,
+                nft-id: none,
+                has-nft: false
             }
         )
         
@@ -342,7 +430,9 @@
                 total-streams: u0,
                 created-at: stacks-block-height,
                 active: true,
-                is-collaboration: true
+                is-collaboration: true,
+                nft-id: none,
+                has-nft: false
             }
         )
         
@@ -409,10 +499,108 @@
     )
 )
 
+;; NEW NFT FUNCTIONS
+
+(define-public (mint-track-nft (track-id uint) (token-uri (string-ascii 256)))
+    (let ((track-data (unwrap! (map-get? tracks { track-id: track-id }) (err err-not-found)))
+          (new-nft-id (+ (var-get nft-counter) u1)))
+        
+        ;; Comprehensive validation
+        (asserts! (is-valid-track-id track-id) (err err-not-found))
+        (asserts! (is-valid-token-uri token-uri) (err err-invalid-token-uri))
+        (asserts! (is-eq tx-sender (get primary-artist track-data)) (err err-unauthorized))
+        (asserts! (not (get has-nft track-data)) (err err-nft-already-minted))
+        
+        ;; Mint the NFT
+        (unwrap! (nft-mint? track-nft new-nft-id tx-sender) (err err-nft-transfer-failed))
+        
+        ;; Update NFT data
+        (map-set track-nfts
+            { nft-id: new-nft-id }
+            {
+                track-id: track-id,
+                owner: tx-sender,
+                token-uri: token-uri,
+                minted-at: stacks-block-height,
+                streaming-rights: true
+            }
+        )
+        
+        ;; Update track with NFT info
+        (map-set tracks 
+            { track-id: track-id }
+            (merge track-data { 
+                nft-id: (some new-nft-id),
+                has-nft: true
+            })
+        )
+        
+        ;; Record ownership history
+        (map-set nft-ownership-history
+            { nft-id: new-nft-id, owner: tx-sender }
+            { acquired-at: stacks-block-height, is-current: true }
+        )
+        
+        (var-set nft-counter new-nft-id)
+        (ok new-nft-id)
+    )
+)
+
+(define-public (transfer-track-nft (nft-id uint) (sender principal) (recipient principal))
+    (let ((nft-data (unwrap! (map-get? track-nfts { nft-id: nft-id }) (err err-nft-not-found))))
+        
+        ;; Comprehensive validation
+        (asserts! (is-valid-nft-id nft-id) (err err-nft-not-found))
+        (asserts! (is-valid-principal sender) (err err-invalid-collaborators))
+        (asserts! (is-valid-principal recipient) (err err-invalid-collaborators))
+        (asserts! (is-eq tx-sender sender) (err err-unauthorized))
+        (asserts! (is-eq sender (get owner nft-data)) (err err-unauthorized))
+        
+        ;; Transfer the NFT
+        (unwrap! (nft-transfer? track-nft nft-id sender recipient) (err err-nft-transfer-failed))
+        
+        ;; Update NFT ownership
+        (map-set track-nfts
+            { nft-id: nft-id }
+            (merge nft-data { owner: recipient })
+        )
+        
+        ;; Update ownership history
+        (map-set nft-ownership-history
+            { nft-id: nft-id, owner: sender }
+            { acquired-at: stacks-block-height, is-current: false }
+        )
+        
+        (map-set nft-ownership-history
+            { nft-id: nft-id, owner: recipient }
+            { acquired-at: stacks-block-height, is-current: true }
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (toggle-nft-streaming-rights (nft-id uint))
+    (let ((nft-data (unwrap! (map-get? track-nfts { nft-id: nft-id }) (err err-nft-not-found))))
+        
+        ;; Comprehensive validation
+        (asserts! (is-valid-nft-id nft-id) (err err-nft-not-found))
+        (asserts! (is-eq tx-sender (get owner nft-data)) (err err-unauthorized))
+        
+        (map-set track-nfts
+            { nft-id: nft-id }
+            (merge nft-data { streaming-rights: (not (get streaming-rights nft-data)) })
+        )
+        
+        (ok true)
+    )
+)
+
 (define-public (stream-track (track-id uint))
     (let ((track-data (unwrap! (map-get? tracks { track-id: track-id }) (err err-not-found)))
           (stream-cost (get price-per-stream track-data))
           (is-collab (get is-collaboration track-data))
+          (has-nft-check (get has-nft track-data))
           (current-history (default-to { stream-count: u0, last-streamed: u0 } 
                                       (map-get? stream-history { listener: tx-sender, track-id: track-id }))))
         
@@ -420,38 +608,108 @@
         (asserts! (get active track-data) (err err-not-found))
         (asserts! (> stream-cost u0) (err err-invalid-price))
         
-        ;; Handle payment - transfer to primary artist for now
-        (unwrap! (stx-transfer? stream-cost tx-sender (get primary-artist track-data)) (err err-insufficient-payment))
-        
-        ;; Update track stream count
-        (map-set tracks 
-            { track-id: track-id }
-            (merge track-data { total-streams: (+ (get total-streams track-data) u1) })
-        )
-        
-        ;; Update listener's stream history
-        (map-set stream-history 
-            { listener: tx-sender, track-id: track-id }
-            { 
-                stream-count: (+ (get stream-count current-history) u1),
-                last-streamed: stacks-block-height
-            }
-        )
-        
-        ;; Update earnings for collaborators
-        (if is-collab
-            (match (update-collaboration-earnings track-id stream-cost)
-                success-val true
-                error-val false
+        ;; Check NFT streaming rights if NFT exists
+        (if has-nft-check
+            (match (get nft-id track-data)
+                nft-id-val 
+                (if (has-streaming-rights nft-id-val tx-sender)
+                    ;; NFT owner can stream for free
+                    (begin
+                        ;; Update track stream count
+                        (map-set tracks 
+                            { track-id: track-id }
+                            (merge track-data { total-streams: (+ (get total-streams track-data) u1) })
+                        )
+                        
+                        ;; Update listener's stream history
+                        (map-set stream-history 
+                            { listener: tx-sender, track-id: track-id }
+                            { 
+                                stream-count: (+ (get stream-count current-history) u1),
+                                last-streamed: stacks-block-height
+                            }
+                        )
+                        
+                        ;; Update total streams
+                        (var-set total-streams (+ (var-get total-streams) u1))
+                        true
+                    )
+                    ;; Non-NFT owner pays regular price
+                    (begin
+                        ;; Handle payment - transfer to primary artist for now
+                        (unwrap! (stx-transfer? stream-cost tx-sender (get primary-artist track-data)) (err err-insufficient-payment))
+                        
+                        ;; Update track stream count
+                        (map-set tracks 
+                            { track-id: track-id }
+                            (merge track-data { total-streams: (+ (get total-streams track-data) u1) })
+                        )
+                        
+                        ;; Update listener's stream history
+                        (map-set stream-history 
+                            { listener: tx-sender, track-id: track-id }
+                            { 
+                                stream-count: (+ (get stream-count current-history) u1),
+                                last-streamed: stacks-block-height
+                            }
+                        )
+                        
+                        ;; Update earnings for collaborators
+                        (if is-collab
+                            (match (update-collaboration-earnings track-id stream-cost)
+                                success-val true
+                                error-val false
+                            )
+                            (begin
+                                (update-artist-earnings (get primary-artist track-data) stream-cost)
+                                true
+                            )
+                        )
+                        
+                        ;; Update total streams
+                        (var-set total-streams (+ (var-get total-streams) u1))
+                        true
+                    )
+                )
+                false
             )
+            ;; No NFT - regular payment required
             (begin
-                (update-artist-earnings (get primary-artist track-data) stream-cost)
+                ;; Handle payment - transfer to primary artist for now
+                (unwrap! (stx-transfer? stream-cost tx-sender (get primary-artist track-data)) (err err-insufficient-payment))
+                
+                ;; Update track stream count
+                (map-set tracks 
+                    { track-id: track-id }
+                    (merge track-data { total-streams: (+ (get total-streams track-data) u1) })
+                )
+                
+                ;; Update listener's stream history
+                (map-set stream-history 
+                    { listener: tx-sender, track-id: track-id }
+                    { 
+                        stream-count: (+ (get stream-count current-history) u1),
+                        last-streamed: stacks-block-height
+                    }
+                )
+                
+                ;; Update earnings for collaborators
+                (if is-collab
+                    (match (update-collaboration-earnings track-id stream-cost)
+                        success-val true
+                        error-val false
+                    )
+                    (begin
+                        (update-artist-earnings (get primary-artist track-data) stream-cost)
+                        true
+                    )
+                )
+                
+                ;; Update total streams
+                (var-set total-streams (+ (var-get total-streams) u1))
                 true
             )
         )
-        
-        ;; Update total streams
-        (var-set total-streams (+ (var-get total-streams) u1))
         
         (ok true)
     )
@@ -501,6 +759,7 @@
         ;; Check if adding this percentage would exceed 100%
         (asserts! (<= (+ (get total-percentage summary) royalty-percentage) u100) (err err-invalid-splits))
         
+        ;; Add the collaborator
         (map-set track-collaborators
             { track-id: track-id, collaborator: new-collaborator }
             { royalty-percentage: royalty-percentage, is-primary: false }
@@ -511,6 +770,7 @@
             { active: true }
         )
         
+        ;; Update collaboration summary
         (map-set collaboration-summary
             { track-id: track-id }
             { 
@@ -519,15 +779,7 @@
             }
         )
         
-        ;; Update track to collaboration if it wasn't already
-        (if (not (get is-collaboration track-data))
-            (map-set tracks 
-                { track-id: track-id }
-                (merge track-data { is-collaboration: true })
-            )
-            true
-        )
-        
+        ;; Return success response
         (ok true)
     )
 )
