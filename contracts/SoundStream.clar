@@ -19,8 +19,12 @@
 (define-constant err-nft-already-minted (err u112))
 (define-constant err-invalid-token-uri (err u113))
 (define-constant err-nft-transfer-failed (err u114))
+(define-constant err-invalid-quantity (err u115))
+(define-constant err-insufficient-credits (err u116))
 
 (define-constant max-collaborators u10)
+(define-constant min-batch-quantity u5)
+(define-constant batch-discount-percentage u10)
 
 ;; NFT Definition
 (define-non-fungible-token track-nft uint)
@@ -95,6 +99,11 @@
     { acquired-at: uint, is-current: bool }
 )
 
+(define-map streaming-credits
+    { listener: principal }
+    { credits: uint, last-updated: uint }
+)
+
 ;; Private helper functions (must be defined first)
 (define-private (is-valid-royalty-rate (rate uint))
     (and (>= rate u0) (<= rate u100))
@@ -122,6 +131,17 @@
 
 (define-private (is-valid-principal (user principal))
     (not (is-eq user 'SP000000000000000000002Q6VF78))
+)
+
+(define-private (is-valid-quantity (quantity uint))
+    (and (>= quantity min-batch-quantity) (<= quantity u1000))
+)
+
+(define-private (calculate-batch-discount (quantity uint) (base-price uint))
+    (let ((total-price (* quantity base-price))
+          (discount-amount (/ (* total-price batch-discount-percentage) u100)))
+        (- total-price discount-amount)
+    )
 )
 
 (define-private (is-track-collaborator (track-id uint) (user principal))
@@ -329,7 +349,93 @@
     )
 )
 
+(define-read-only (get-streaming-credits (listener principal))
+    (if (is-valid-principal listener)
+        (map-get? streaming-credits { listener: listener })
+        none
+    )
+)
+
+(define-read-only (calculate-batch-price (quantity uint) (base-price uint))
+    (if (and (is-valid-quantity quantity) (is-valid-price base-price))
+        (ok (calculate-batch-discount quantity base-price))
+        (err err-invalid-quantity)
+    )
+)
+
 ;; Public functions
+(define-public (purchase-streaming-credits (track-id uint) (quantity uint))
+    (let ((track-data (unwrap! (map-get? tracks { track-id: track-id }) (err err-not-found)))
+          (base-price (get price-per-stream track-data))
+          (discounted-price (calculate-batch-discount quantity base-price))
+          (current-credits (default-to { credits: u0, last-updated: u0 }
+                                      (map-get? streaming-credits { listener: tx-sender }))))
+        
+        (asserts! (is-valid-track-id track-id) (err err-not-found))
+        (asserts! (is-valid-quantity quantity) (err err-invalid-quantity))
+        (asserts! (get active track-data) (err err-not-found))
+        (asserts! (is-valid-price base-price) (err err-invalid-price))
+        
+        ;; Transfer payment to primary artist
+        (unwrap! (stx-transfer? discounted-price tx-sender (get primary-artist track-data)) (err err-insufficient-payment))
+        
+        ;; Update streaming credits
+        (map-set streaming-credits
+            { listener: tx-sender }
+            {
+                credits: (+ (get credits current-credits) quantity),
+                last-updated: stacks-block-height
+            }
+        )
+        
+        ;; Update artist earnings with full discounted amount
+        (update-artist-earnings (get primary-artist track-data) discounted-price)
+        
+        (ok quantity)
+    )
+)
+
+(define-public (stream-with-credits (track-id uint))
+    (let ((track-data (unwrap! (map-get? tracks { track-id: track-id }) (err err-not-found)))
+          (user-credits (unwrap! (map-get? streaming-credits { listener: tx-sender }) (err err-insufficient-credits)))
+          (current-history (default-to { stream-count: u0, last-streamed: u0 }
+                                      (map-get? stream-history { listener: tx-sender, track-id: track-id }))))
+        
+        (asserts! (is-valid-track-id track-id) (err err-not-found))
+        (asserts! (get active track-data) (err err-not-found))
+        (asserts! (>= (get credits user-credits) u1) (err err-insufficient-credits))
+        
+        ;; Deduct one credit
+        (map-set streaming-credits
+            { listener: tx-sender }
+            {
+                credits: (- (get credits user-credits) u1),
+                last-updated: stacks-block-height
+            }
+        )
+        
+        ;; Update track stream count
+        (map-set tracks
+            { track-id: track-id }
+            (merge track-data { total-streams: (+ (get total-streams track-data) u1) })
+        )
+        
+        ;; Update listener's stream history
+        (map-set stream-history
+            { listener: tx-sender, track-id: track-id }
+            {
+                stream-count: (+ (get stream-count current-history) u1),
+                last-streamed: stacks-block-height
+            }
+        )
+        
+        ;; Update total streams
+        (var-set total-streams (+ (var-get total-streams) u1))
+        
+        (ok true)
+    )
+)
+
 (define-public (register-track (title (string-ascii 100)) 
                               (album (string-ascii 100)) 
                               (duration uint) 
